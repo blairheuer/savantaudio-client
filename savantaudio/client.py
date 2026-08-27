@@ -20,9 +20,10 @@ import datetime
 _LOGGER = logging.getLogger(__name__)
 
 # How long to wait for another line before treating a response as complete.
-# Generous enough for a busy switch on a local network, short enough that a
-# response missing its blank-line terminator does not stall the caller.
-READ_TIMEOUT = 2.0
+# Every command that ends on silence rather than a blank line pays this, and a
+# full enumeration is ~180 commands, so keep it tight — a local switch answers
+# in milliseconds.
+READ_TIMEOUT = 0.25
 
 # How long to wait for leftover lines before issuing a new command. Short: on a
 # synchronized stream there is nothing to read and this is pure overhead.
@@ -38,6 +39,7 @@ class Connection:
         self._port = port
         self._writer = None
         self._lock = asyncio.Lock()
+        self._need_drain = False
     
     async def connect(self):
         async with self._lock:
@@ -85,15 +87,22 @@ class Connection:
                 self._reader.readline(), timeout=READ_TIMEOUT
             )
         except asyncio.TimeoutError:
+            # Ended on silence rather than a terminator, so a late line may
+            # still arrive. Flag the stream for draining before the next
+            # command instead of letting the offset persist.
+            self._need_drain = True
             return b""
 
     async def _drain_stale(self) -> None:
         """Discard anything left unread before issuing a new command.
 
-        Belt and braces alongside `_readline`: if a response ever does arrive
-        late, this resynchronizes the stream on the next command instead of
-        carrying the offset forward for the life of the connection.
+        Only runs when the previous response ended on a timeout; on a healthy
+        stream this is skipped entirely, which matters because the switch takes
+        ~180 commands to enumerate and any per-command delay is multiplied.
         """
+        if not self._need_drain:
+            return
+        self._need_drain = False
         while True:
             try:
                 data = await asyncio.wait_for(
