@@ -19,6 +19,15 @@ import datetime
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long to wait for another line before treating a response as complete.
+# Generous enough for a busy switch on a local network, short enough that a
+# response missing its blank-line terminator does not stall the caller.
+READ_TIMEOUT = 2.0
+
+# How long to wait for leftover lines before issuing a new command. Short: on a
+# synchronized stream there is nothing to read and this is pure overhead.
+DRAIN_TIMEOUT = 0.05
+
 class Model(Enum):
     SSA_3220 = 'SSA-3200'
     SSA_3220D = 'SSA-3220D'
@@ -61,16 +70,52 @@ class Connection:
     def writer(self):
         return self._writer
     
+    async def _readline(self) -> bytes:
+        """Read one line, treating silence as end-of-response.
+
+        The switch terminates most responses with a blank line, but not all of
+        them: `aoutput-delayboth-get<n>` answers with two lines and no
+        terminator. Blocking indefinitely on the terminator leaves those extra
+        lines to be read as the *next* command's response, permanently
+        offsetting replies from commands. A bounded read ends the response at
+        the point the switch stops talking.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._reader.readline(), timeout=READ_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return b""
+
+    async def _drain_stale(self) -> None:
+        """Discard anything left unread before issuing a new command.
+
+        Belt and braces alongside `_readline`: if a response ever does arrive
+        late, this resynchronizes the stream on the next command instead of
+        carrying the offset forward for the life of the connection.
+        """
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    self._reader.readline(), timeout=DRAIN_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                return
+            if not data:
+                return
+            _LOGGER.debug(f'Discarding stale reply: {data!r}')
+
     async def send(self, command: str) -> str:
         while True:
             try:
                 async with self._lock:
                     if self._writer is None:
                         await self._connect() # already holding lock
+                    await self._drain_stale() # already holding lock
                     self._ts = datetime.datetime.now()
                     self._writer.write(command.encode("ASCII") + b"\r\n")
                     await self._writer.drain()
-                    data = await self._reader.readline()
+                    data = await self._readline()
                     response = data.decode().strip()
                     if len(response) > 0: 
                         yield response
@@ -79,7 +124,7 @@ class Connection:
                         await self._close() # already holding lock
                         continue
                     while True:
-                        data = await self._reader.readline()
+                        data = await self._readline()
                         response = data.decode().strip()
                         if len(response) > 0: 
                             yield response
